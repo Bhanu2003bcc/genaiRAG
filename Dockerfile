@@ -21,9 +21,9 @@ USER appuser
 # Expose port 8080 to match original Java backend setup
 EXPOSE 8080
 
-# Health check — extended start-period to allow gunicorn to fork all workers
+# Health check — check the port dynamically
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-  CMD curl -f http://localhost:8080/api/actuator/health || exit 1
+  CMD curl -f http://localhost:${PORT:-8080}/api/actuator/health || exit 1
 
 # Run via Gunicorn + UvicornWorker (multi-process, production-grade)
 # Worker count and all tuning is in gunicorn.conf.py
