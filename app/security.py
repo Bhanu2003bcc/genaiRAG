@@ -1,83 +1,135 @@
-from datetime import datetime, timedelta
+import asyncio
+import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+from uuid import UUID
+
 import bcrypt
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from app.config import settings
-from app.database import get_db
-from app.models import User
 
-# HTTP Bearer token dependency
+from app.config import settings
+from app.schemas import CurrentUser
+
+logger = logging.getLogger("app.security")
+
+ALGORITHM = "HS256"
 security_scheme = HTTPBearer(auto_error=False)
 
+# Limit concurrent CPU-intensive bcrypt hashing/verification to prevent thread pool saturation
+bcrypt_semaphore = asyncio.Semaphore(settings.bcrypt_max_concurrent)
+
+
+# =========================
+# PASSWORD HASHING
+# =========================
+
 def hash_password(password: str) -> str:
-    # Encodes password and generates salt with bcrypt
-    passwd_bytes = password.encode("utf-8")
-    salt = bcrypt.gensalt()
-    hashed = bcrypt.hashpw(passwd_bytes, salt)
+    """Synchronous bcrypt hash."""
+    password_bytes = password.encode("utf-8")
+    hashed = bcrypt.hashpw(password_bytes, bcrypt.gensalt(rounds=12))
     return hashed.decode("utf-8")
 
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    passwd_bytes = plain_password.encode("utf-8")
-    hashed_bytes = hashed_password.encode("utf-8")
+    """Synchronous bcrypt verification."""
     try:
-        return bcrypt.checkpw(passwd_bytes, hashed_bytes)
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8")
+        )
     except Exception:
         return False
 
-def generate_token(username: str, role: str) -> str:
-    expire = datetime.utcnow() + timedelta(milliseconds=settings.jwt_expiration_ms)
-    # Replicate Spring Security role convention: prefix with ROLE_
+
+async def hash_password_async(password: str) -> str:
+    """Asynchronous wrapper for hash_password using semaphore and thread pool."""
+    async with bcrypt_semaphore:
+        return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    """Asynchronous wrapper for verify_password using semaphore and thread pool."""
+    async with bcrypt_semaphore:
+        return await asyncio.to_thread(verify_password, plain_password, hashed_password)
+
+
+# =========================
+# JWT TOKEN GENERATION
+# =========================
+
+def generate_token(
+    user_id: UUID,
+    username: str,
+    role: str
+) -> str:
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(milliseconds=settings.jwt_expiration_ms)
+
     authority = f"ROLE_{role}" if not role.startswith("ROLE_") else role
+
     payload = {
-        "sub": username,
+        "sub": str(user_id),
+        "username": username,
         "role": authority,
-        "iat": datetime.utcnow(),
-        "exp": expire
+        "iat": now,
+        "exp": expire,
+        "type": "access"
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+
+    return jwt.encode(payload, settings.jwt_secret, algorithm=ALGORITHM)
+
+
+# =========================
+# CURRENT USER DEPENDENCY
+# =========================
 
 async def get_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
-    db: AsyncSession = Depends(get_db)
-) -> User:
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)
+) -> CurrentUser:
+    """
+    Decodes the JWT token and extracts user identity info.
+    No database lookup is performed to prevent connection pool starvation.
+    """
     if not credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization Header"
+            detail="Authentication credentials missing"
         )
-    
+
     token = credentials.credentials
+
     try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
-        username: str = payload.get("sub")
-        if username is None:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=[ALGORITHM]
+        )
+
+        user_id_str = payload.get("sub")
+        username = payload.get("username")
+        role = payload.get("role")
+
+        if not user_id_str or not username or not role:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid token claims"
+                detail="Invalid authentication token claims"
             )
-    except JWTError as e:
+
+        user_id = UUID(user_id_str)
+        # Replicate Spring Security role convention: strip ROLE_ prefix if present
+        role_name = role[5:] if role.startswith("ROLE_") else role
+
+        return CurrentUser(
+            id=user_id,
+            username=username,
+            role=role_name
+        )
+
+    except (JWTError, ValueError) as e:
+        logger.warning(f"JWT decode failed: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token validation failed: {str(e)}"
+            detail="Invalid or expired authentication token"
         )
-    
-    # Load user from database
-    result = await db.execute(select(User).filter(User.username == username))
-    user = result.scalars().first()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Authenticated user not found"
-        )
-    
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is deactivated"
-        )
-        
-    return user

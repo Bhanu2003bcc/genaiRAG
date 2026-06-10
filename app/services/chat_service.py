@@ -1,332 +1,729 @@
-import logging
+
 import json
+import logging
 import math
+from typing import AsyncGenerator, List, Optional
 from uuid import UUID
-from typing import List, Optional, AsyncGenerator
+
+# pyrefly: ignore [missing-import]
 from fastapi import HTTPException, status
-from sqlalchemy import select, func, desc, delete, text
+# pyrefly: ignore [missing-import]
+from sqlalchemy import desc, func, select, text
+# pyrefly: ignore [missing-import]
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Conversation, Message, User
-from app.schemas import ChatRequest, ChatResponse, ConversationResponse, MessageResponse, SourceReference, PageResponse
 from app.database import AsyncSessionLocal
+from app.models import (
+    Conversation,
+    Message,
+    MessageRole
+)
+from app.schemas import (
+    ChatRequest,
+    ChatResponse,
+    ConversationResponse,
+    MessageResponse,
+    PageResponse,
+    SourceReference,
+    CurrentUser
+)
 from app.services.gemini_service import gemini_service
+from app.utils.metrics import metrics_collector
+import time
 
-logger = logging.getLogger("com.rag.service.impl.ChatServiceImpl")
+logger = logging.getLogger("app.chat")
+
 
 class ChatService:
-    SYSTEM_PROMPT_TEMPLATE = """You are a helpful AI assistant with access to the user's documents.
-Use the following context retrieved from the user's documents to answer the question.
-If the answer cannot be found in the context, say so clearly.
-Always cite which document the information comes from when possible.
-Be concise, accurate, and helpful.
 
-CONTEXT FROM DOCUMENTS:
-{}"""
+    MAX_HISTORY_MESSAGES = 12
+    MAX_CONTEXT_CHUNKS = 8
+    MIN_RELEVANCE_SCORE = 0.45
 
-    async def get_or_create_conversation(self, conversation_id: Optional[UUID], user_id: UUID, db: AsyncSession) -> Conversation:
+    SYSTEM_PROMPT_TEMPLATE = """
+You are a grounded AI assistant.
+
+Rules:
+- Answer ONLY using the provided document context.
+- If answer is not found, explicitly say so.
+- Do not hallucinate.
+- Cite document sources naturally.
+- Keep responses concise and factual.
+
+DOCUMENT CONTEXT:
+{context}
+"""
+
+    # =========================
+    # CONVERSATION
+    # =========================
+
+    async def get_or_create_conversation(
+        self,
+        conversation_id: Optional[UUID],
+        user_id: UUID,
+        db: AsyncSession
+    ) -> Conversation:
+
         if conversation_id:
-            stmt = select(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
-            result = await db.execute(stmt)
+
+            result = await db.execute(
+                select(Conversation).where(
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user_id
+                )
+            )
+
             conversation = result.scalars().first()
+
             if not conversation:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Conversation not found with id: {str(conversation_id)}"
+                    detail="Conversation not found"
                 )
+
             return conversation
-        
-        conversation = Conversation(user_id=user_id)
+
+        conversation = Conversation(
+            user_id=user_id
+        )
+
         db.add(conversation)
+
         await db.commit()
         await db.refresh(conversation)
+
         return conversation
 
-    async def _build_history(self, conversation_id: UUID, db: AsyncSession) -> List[str]:
-        # Load top 10 messages ordered by created_at desc (newest first)
-        stmt = (
-            select(Message)
-            .filter(Message.conversation_id == conversation_id)
-            .order_by(desc(Message.created_at))
-            .limit(10)
-        )
-        result = await db.execute(stmt)
-        messages = list(result.scalars().all())
-        # Reverse to get oldest first (ascending order)
-        messages.reverse()
-        return [m.content for m in messages]
+    # =========================
+    # HISTORY
+    # =========================
 
-    async def _hybrid_search(self, user_id: UUID, query_text: str, query_embedding: List[float], limit: int, db: AsyncSession) -> List[dict]:
-        # Perform hybrid search query via native SQL execution
-        query_str = """
-            SELECT dc.id, dc.document_id, dc.chunk_index, dc.content, 
-                   d.title AS doc_title
-            FROM document_chunks dc
-            JOIN documents d ON dc.document_id = d.id
-            WHERE d.user_id = :user_id
-            ORDER BY (
-                0.7 * (1 - (dc.embedding <=> CAST(:embedding AS vector))) +
-                0.3 * ts_rank(dc.content_tsv, plainto_tsquery('english', :query))
-            ) DESC
-            LIMIT :limit
-        """
-        
-        # Format embedding list to PostgreSQL array-like vector string e.g. [0.1, 0.2, ...]
-        embedding_str = f"[{','.join(map(str, query_embedding))}]"
-        
+    async def _build_history(
+        self,
+        conversation_id: UUID,
+        db: AsyncSession
+    ) -> List[dict]:
+
         result = await db.execute(
-            text(query_str),
-            {
-                "user_id": user_id,
-                "embedding": embedding_str,
-                "query": query_text,
-                "limit": limit
-            }
+            select(Message)
+            .where(
+                Message.conversation_id
+                == conversation_id
+            )
+            .order_by(desc(Message.created_at))
+            .limit(self.MAX_HISTORY_MESSAGES)
         )
-        
-        # Return list of dictionaries containing properties
-        return [dict(row._mapping) for row in result.all()]
 
-    def _build_context(self, chunks: List[dict]) -> str:
-        if not chunks:
-            return "No relevant documents found."
+        messages = list(
+            result.scalars().all()
+        )
+
+        messages.reverse()
+
+        return [
+            {
+                "role": msg.role.value if hasattr(msg.role, "value") else str(msg.role),
+                "content": msg.content
+            }
+            for msg in messages
+        ]
+
+    # =========================
+    # HYBRID SEARCH
+    # =========================
+
+    async def _hybrid_search(
+        self,
+        user_id: UUID,
+        query_text: str,
+        query_embedding: List[float],
+        limit: int,
+        db: AsyncSession
+    ) -> List[dict]:
+        """
+        Reciprocal Rank Fusion (RRF) hybrid search.
+
+        Two independent queries are executed:
+          1. Vector similarity search via the HNSW index (cosine distance).
+          2. Full-text keyword search via the GIN index (ts_rank).
+
+        Their ranked lists are fused on the Python side with:
+            rrf_score(d) = 1/(k + vector_rank) + 1/(k + fts_rank)
+        where k=60 is the standard constant (Cormack et al., 2009).
+
+        Advantages over the previous weighted sum:
+          - Scale-agnostic: cosine distance [0,1] and ts_rank (unbounded)
+            no longer fight each other.
+          - Configurable via settings (rrf_k, rrf_candidate_multiplier).
+          - Adds d.status = 'COMPLETED' guard so in-progress/failed
+            documents are never surfaced to the user.
+        """
+        from app.config import settings as _s
+
+        candidate_k = min(limit, self.MAX_CONTEXT_CHUNKS) * _s.rrf_candidate_multiplier
+        k = _s.rrf_k
+        embedding_str = f"[{','.join(map(str, query_embedding))}]"
+
+        # ----------------------------------------------------------------
+        # Query 1 — HNSW vector similarity
+        # ----------------------------------------------------------------
+        vector_result = await db.execute(
+            text("""
+                SELECT
+                    dc.id::text          AS id,
+                    dc.document_id::text AS document_id,
+                    dc.chunk_index,
+                    dc.content,
+                    d.title              AS doc_title,
+                    ROW_NUMBER() OVER (
+                        ORDER BY dc.embedding <=> CAST(:embedding AS vector)
+                    )                    AS vector_rank
+                FROM document_chunks dc
+                JOIN documents d ON dc.document_id = d.id
+                WHERE d.user_id = :user_id
+                  AND d.status  = 'COMPLETED'
+                ORDER BY dc.embedding <=> CAST(:embedding AS vector)
+                LIMIT :candidate_k
+            """),
+            {
+                "user_id": str(user_id),
+                "embedding": embedding_str,
+                "candidate_k": candidate_k,
+            },
+        )
+        vector_rows = {
+            row.id: dict(row._mapping)
+            for row in vector_result.all()
+        }
+
+        # ----------------------------------------------------------------
+        # Query 2 — GIN full-text search (skipped for empty queries)
+        # ----------------------------------------------------------------
+        fts_ranks: dict = {}
+        if query_text and query_text.strip():
+            fts_result = await db.execute(
+                text("""
+                    SELECT
+                        dc.id::text AS id,
+                        ROW_NUMBER() OVER (
+                            ORDER BY ts_rank(
+                                dc.content_tsv,
+                                plainto_tsquery('english', :query)
+                            ) DESC
+                        ) AS fts_rank
+                    FROM document_chunks dc
+                    JOIN documents d ON dc.document_id = d.id
+                    WHERE d.user_id = :user_id
+                      AND d.status  = 'COMPLETED'
+                      AND dc.content_tsv @@ plainto_tsquery('english', :query)
+                    ORDER BY fts_rank
+                    LIMIT :candidate_k
+                """),
+                {
+                    "user_id": str(user_id),
+                    "query": query_text,
+                    "candidate_k": candidate_k,
+                },
+            )
+            fts_ranks = {
+                row.id: int(row.fts_rank)
+                for row in fts_result.all()
+            }
+
+        # ----------------------------------------------------------------
+        # Python-side RRF fusion
+        # ----------------------------------------------------------------
+        all_ids = set(vector_rows.keys()) | set(fts_ranks.keys())
+
+        scored: List[tuple] = []
+        for chunk_id in all_ids:
+            v_rank = int(vector_rows[chunk_id]["vector_rank"]) if chunk_id in vector_rows else candidate_k + 1
+            f_rank = fts_ranks.get(chunk_id, candidate_k + 1)
+            rrf_score = 1.0 / (k + v_rank) + 1.0 / (k + f_rank)
+            scored.append((rrf_score, chunk_id))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
         
-        formatted_chunks = []
-        for c in chunks:
-            formatted_chunks.append(f"[From: {c['doc_title']}]\n{c['content']}")
+        # Decide how many candidate chunks to fetch
+        fetch_limit = min(limit, self.MAX_CONTEXT_CHUNKS)
+        if _s.rerank_enabled:
+            fetch_limit = max(fetch_limit, _s.rerank_candidate_pool_size)
             
-        return "\n\n---\n\n".join(formatted_chunks)
+        top = scored[:fetch_limit]
 
-    def _build_sources(self, chunks: List[dict]) -> List[SourceReference]:
+        # Normalise to [0, 1] relative to the best result.
+        max_score = top[0][0] if top else 1.0
+
+        results = []
+        for rrf_score, chunk_id in top:
+            row = vector_rows.get(chunk_id)
+            if row is None:
+                # Chunk appeared only in FTS — fetch its full content.
+                fetch = await db.execute(
+                    text("""
+                        SELECT dc.id::text AS id, dc.document_id::text AS document_id,
+                               dc.chunk_index, dc.content, d.title AS doc_title
+                        FROM document_chunks dc
+                        JOIN documents d ON dc.document_id = d.id
+                        WHERE dc.id = :chunk_id
+                    """),
+                    {"chunk_id": chunk_id},
+                )
+                fetched = fetch.first()
+                if not fetched:
+                    continue
+                row = dict(fetched._mapping)
+
+            normalised = round(rrf_score / max_score, 4)
+            # Add to results first (without gating yet, so LLM re-ranker can grade all candidates)
+            results.append({**row, "relevance_score": normalised})
+
+        # Close database session before making the slow re-ranking API call
+        await db.close()
+
+        # Apply LLM Re-ranking if enabled and we have results
+        if _s.rerank_enabled and results:
+            try:
+                # Call gemini_service to re-rank chunks
+                scores_map = await gemini_service.re_rank_chunks(query_text, results)
+                if scores_map:
+                    # Update relevance_score using LLM scores
+                    for r in results:
+                        cid = r["id"]
+                        if cid in scores_map:
+                            r["relevance_score"] = scores_map[cid]
+                    # Sort results by the new LLM relevance scores
+                    results.sort(key=lambda x: x["relevance_score"], reverse=True)
+            except Exception as e:
+                logger.warning(f"Reranking integration failed, falling back to RRF: {str(e)}")
+
+        # Finally, filter by MIN_RELEVANCE_SCORE and limit to the requested amount
+        filtered_results = [
+            r for r in results
+            if r["relevance_score"] >= self.MIN_RELEVANCE_SCORE
+        ]
+        return filtered_results[:limit]
+
+    # =========================
+    # CONTEXT
+    # =========================
+
+    def _build_context(
+        self,
+        chunks: List[dict]
+    ) -> str:
+
+        if not chunks:
+            return "No relevant document context."
+
+        context_parts = []
+
+        for chunk in chunks:
+
+            sanitized = (
+                chunk["content"]
+                .replace("{", "")
+                .replace("}", "")
+            )
+
+            context_parts.append(
+                f"[Document: {chunk['doc_title']}]\n"
+                f"{sanitized}"
+            )
+
+        return "\n\n---\n\n".join(
+            context_parts
+        )
+
+    # =========================
+    # SOURCES
+    # =========================
+
+    def _build_sources(
+        self,
+        chunks: List[dict]
+    ) -> List[SourceReference]:
+
         sources = []
-        for c in chunks:
-            content = c["content"]
-            excerpt = content[:200] + "..." if len(content) > 200 else content
-            sources.append(SourceReference(
-                documentId=c["document_id"],
-                documentTitle=c["doc_title"],
-                excerpt=excerpt,
-                chunkIndex=c["chunk_index"],
-                relevanceScore=0.85  # Fixed score from original Java implementation
-            ))
+
+        for chunk in chunks:
+
+            excerpt = (
+                chunk["content"][:200]
+                + "..."
+            )
+
+            sources.append(
+                SourceReference(
+                    documentId=chunk["document_id"],
+                    documentTitle=chunk["doc_title"],
+                    excerpt=excerpt,
+                    chunkIndex=chunk["chunk_index"],
+                    relevanceScore=round(
+                        float(chunk["relevance_score"]),
+                        4
+                    )
+                )
+            )
+
         return sources
 
-    async def chat(self, request: ChatRequest, user: User, db: AsyncSession) -> ChatResponse:
-        # Get or create conversation
-        conversation = await self.get_or_create_conversation(request.conversationId, user.id, db)
+    # =========================
+    # CHAT
+    # =========================
 
-        # Generate query embedding
+    async def chat(
+        self,
+        request: ChatRequest,
+        user: CurrentUser,
+        db: AsyncSession
+    ) -> ChatResponse:
+        # Close request-scoped DB session immediately to release connection to the pool
+        await db.close()
+
+        # 1. Generate embedding (no DB connection)
         query_embedding = await gemini_service.generate_embedding(request.message)
+        if not query_embedding:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Embedding service unavailable"
+            )
 
-        # Retrieve relevant chunks via hybrid search
-        chunks = await self._hybrid_search(user.id, request.message, query_embedding, request.maxResults, db)
+        # 2. Acquire a temp database session to query conversation, history, and chunks
+        async with AsyncSessionLocal() as temp_db:
+            conversation = await self.get_or_create_conversation(
+                request.conversationId,
+                user.id,
+                temp_db
+            )
+            
+            history = await self._build_history(
+                conversation.id,
+                temp_db
+            )
+            
+            # _hybrid_search will query DB and close temp_db before reranking!
+            chunks = await self._hybrid_search(
+                user.id,
+                request.message,
+                query_embedding,
+                request.maxResults,
+                temp_db
+            )
+            
+            conv_id = conversation.id
 
-        # Build prompt and history
         context = self._build_context(chunks)
         sources = self._build_sources(chunks)
-        history = await self._build_history(conversation.id, db)
-        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(context)
 
-        # Ask Gemini
-        answer = await gemini_service.generate_answer(system_prompt, request.message, history)
+        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(context=context)
 
-        # Save messages to database
-        user_msg = Message(
-            conversation_id=conversation.id,
-            role="user",
-            content=request.message,
-            sources=[]
+        # 3. Slow LLM Answer Generation (no DB connection held!)
+        start_time = time.perf_counter()
+        answer = await gemini_service.generate_answer(
+            system_prompt=system_prompt,
+            user_message=request.message,
+            history=history
         )
-        assistant_msg = Message(
-            conversation_id=conversation.id,
-            role="assistant",
-            content=answer,
-            sources=[s.model_dump(mode='json') for s in sources]
-        )
-        
-        db.add(user_msg)
-        db.add(assistant_msg)
+        metrics_collector.record_llm_generation(time.perf_counter() - start_time)
 
-        # Auto-title conversation
-        if not conversation.title:
-            title = request.message[:60] + "..." if len(request.message) > 60 else request.message
-            conversation.title = title
-
-        await db.commit()
-        await db.refresh(assistant_msg)
+        # 4. Open a write session to save messages and update conversation title
+        async with AsyncSessionLocal() as write_db:
+            # Re-fetch conversation to avoid detached object issues
+            result = await write_db.execute(
+                select(Conversation).where(Conversation.id == conv_id)
+            )
+            conv = result.scalars().first()
+            
+            user_message = Message(
+                conversation_id=conv_id,
+                role=MessageRole.USER.value,
+                content=request.message,
+                sources=[]
+            )
+            
+            assistant_message = Message(
+                conversation_id=conv_id,
+                role=MessageRole.ASSISTANT.value,
+                content=answer,
+                sources=[
+                    s.model_dump(mode="json")
+                    for s in sources
+                ]
+            )
+            
+            write_db.add(user_message)
+            write_db.add(assistant_message)
+            
+            if conv and not conv.title:
+                conv.title = request.message[:60]
+                
+            await write_db.commit()
+            await write_db.refresh(assistant_message)
+            assistant_msg_id = assistant_message.id
 
         return ChatResponse(
-            conversationId=conversation.id,
-            messageId=assistant_msg.id,
+            conversationId=conv_id,
+            messageId=assistant_msg_id,
             answer=answer,
             sources=sources,
             followUp=len(history) > 0
         )
 
-    async def stream_chat(self, request: ChatRequest, user: User) -> AsyncGenerator[dict, None]:
-        """
-        Asynchronously streams the chat response over Server-Sent Events (SSE).
-        Uses a separate session connection inside the generator to keep DB requests isolated.
-        """
-        # Step 1: Initialize metadata using isolated DB session
-        async with AsyncSessionLocal() as db:
-            conversation = await self.get_or_create_conversation(request.conversationId, user.id, db)
-            conv_id = conversation.id
+    # =========================
+    # STREAM CHAT
+    # =========================
+
+    async def stream_chat(
+        self,
+        request: ChatRequest,
+        user: CurrentUser
+    ) -> AsyncGenerator[dict, None]:
+        # 1. Generate embedding first (no DB connection)
+        query_embedding = await gemini_service.generate_embedding(request.message)
+        if not query_embedding:
+            yield {
+                "event": "error",
+                "data": "Embedding generation failed"
+            }
+            return
+
+        # 2. Open temp database session to check conversation, history, chunks and save user message
+        async with AsyncSessionLocal() as temp_db:
+            conversation = await self.get_or_create_conversation(
+                request.conversationId,
+                user.id,
+                temp_db
+            )
             
-            # Save user message immediately
-            user_msg = Message(
-                conversation_id=conv_id,
-                role="user",
+            history = await self._build_history(
+                conversation.id,
+                temp_db
+            )
+            
+            user_message = Message(
+                conversation_id=conversation.id,
+                role=MessageRole.USER.value,
                 content=request.message,
                 sources=[]
             )
-            db.add(user_msg)
-            await db.commit()
+            temp_db.add(user_message)
+            await temp_db.commit()
             
-            # Retrieve search chunks & build history
-            query_embedding = await gemini_service.generate_embedding(request.message)
-            chunks = await self._hybrid_search(user.id, request.message, query_embedding, request.maxResults, db)
-            history = await self._build_history(conv_id, db)
+            # _hybrid_search will query DB and close temp_db before reranking!
+            chunks = await self._hybrid_search(
+                user.id,
+                request.message,
+                query_embedding,
+                request.maxResults,
+                temp_db
+            )
+            
+            conv_id = conversation.id
 
-        # Step 2: Build context & sources
         context = self._build_context(chunks)
         sources = self._build_sources(chunks)
-        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(context)
+        system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(context=context)
 
-        # Yield sources metadata first matching SseEmitter flow in Spring Boot
-        sources_list = [s.model_dump(mode='json') for s in sources]
         yield {
             "event": "sources",
-            "data": json.dumps(sources_list)
+            "data": json.dumps([
+                s.model_dump(mode="json")
+                for s in sources
+            ])
         }
 
-        # Step 3: Stream content chunks
-        full_answer = []
-        async for chunk in gemini_service.stream_answer(system_prompt, request.message, history):
-            full_answer.append(chunk)
+        full_response = []
+        try:
+            start_time = time.perf_counter()
+            async for token in gemini_service.stream_answer(
+                system_prompt=system_prompt,
+                user_message=request.message,
+                history=history
+            ):
+                full_response.append(token)
+                yield {
+                    "event": "chunk",
+                    "data": token
+                }
+            metrics_collector.record_llm_generation(time.perf_counter() - start_time)
+        except Exception as e:
+            logger.exception(f"Streaming failed: {str(e)}")
             yield {
-                "event": "chunk",
-                "data": chunk
+                "event": "error",
+                "data": "Streaming failed"
+            }
+            return
+
+        answer = "".join(full_response)
+
+        # 3. Save assistant message and update conversation title inside a write transaction
+        async with AsyncSessionLocal() as write_db:
+            result = await write_db.execute(
+                select(Conversation).where(Conversation.id == conv_id)
+            )
+            conv = result.scalars().first()
+            
+            assistant_message = Message(
+                conversation_id=conv_id,
+                role=MessageRole.ASSISTANT.value,
+                content=answer,
+                sources=[
+                    s.model_dump(mode="json")
+                    for s in sources
+                ]
+            )
+            write_db.add(assistant_message)
+            
+            if conv and not conv.title:
+                conv.title = request.message[:60]
+                
+            await write_db.commit()
+            await write_db.refresh(assistant_message)
+            assistant_msg_id = assistant_message.id
+
+            yield {
+                "event": "done",
+                "data": json.dumps({
+                    "conversationId": str(conv_id),
+                    "messageId": str(assistant_msg_id)
+                })
             }
 
-        # Step 4: Finalize conversation & save response
-        async with AsyncSessionLocal() as db:
-            answer_text = "".join(full_answer)
-            assistant_msg = Message(
-                conversation_id=conv_id,
-                role="assistant",
-                content=answer_text,
-                sources=sources_list
-            )
-            db.add(assistant_msg)
-            
-            # Load conversation to check title & update updated_at
-            stmt = select(Conversation).filter(Conversation.id == conv_id)
-            res = await db.execute(stmt)
-            conv = res.scalars().first()
-            if conv and not conv.title:
-                title = request.message[:60] + "..." if len(request.message) > 60 else request.message
-                conv.title = title
-            
-            await db.commit()
-            await db.refresh(assistant_msg)
-            assistant_id = assistant_msg.id
 
-        # Yield done event indicating full stream completion
-        yield {
-            "event": "done",
-            "data": json.dumps({
-                "conversationId": str(conv_id),
-                "messageId": str(assistant_id)
-            })
-        }
+    # =========================
+    # CONVERSATION CRUD
+    # =========================
 
-    async def get_conversations(self, user_id: UUID, page: int, size: int, db: AsyncSession) -> PageResponse[ConversationResponse]:
-        # Count total elements
-        count_stmt = select(func.count()).select_from(Conversation).filter(Conversation.user_id == user_id)
-        count_result = await db.execute(count_stmt)
-        total_elements = count_result.scalar() or 0
+    async def get_conversations(
+        self,
+        user_id: UUID,
+        page: int,
+        size: int,
+        db: AsyncSession
+    ) -> PageResponse:
+        """
+        Return a paginated list of conversations for a user,
+        ordered most-recent first, without loading messages.
+        """
+        offset = page * size
 
-        # Query paginated conversations
-        stmt = (
+        # Total count
+        count_result = await db.execute(
+            select(func.count()).select_from(Conversation)
+            .where(Conversation.user_id == user_id)
+        )
+        total = count_result.scalar_one()
+
+        # Page of conversations
+        rows_result = await db.execute(
             select(Conversation)
-            .filter(Conversation.user_id == user_id)
+            .where(Conversation.user_id == user_id)
             .order_by(desc(Conversation.updated_at))
-            .offset(page * size)
+            .offset(offset)
             .limit(size)
         )
-        result = await db.execute(stmt)
-        conversations = result.scalars().all()
+        convs = list(rows_result.scalars().all())
 
-        content = []
-        for c in conversations:
-            content.append(ConversationResponse(
+        conv_responses = [
+            ConversationResponse(
                 id=c.id,
                 title=c.title,
+                messages=None,
                 createdAt=c.created_at,
                 updatedAt=c.updated_at
-            ))
-
-        total_pages = math.ceil(total_elements / size) if size > 0 else 0
+            )
+            for c in convs
+        ]
 
         return PageResponse(
-            content=content,
+            content=conv_responses,
             page=page,
             size=size,
-            totalElements=total_elements,
-            totalPages=total_pages
+            totalElements=total,
+            totalPages=max(1, math.ceil(total / size)) if size else 1
         )
 
-    async def get_conversation(self, conversation_id: UUID, user_id: UUID, db: AsyncSession) -> ConversationResponse:
-        # Get conversation
-        stmt = select(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
-        result = await db.execute(stmt)
+    async def get_conversation(
+        self,
+        conversation_id: UUID,
+        user_id: UUID,
+        db: AsyncSession
+    ) -> ConversationResponse:
+        """
+        Return a single conversation with all its messages.
+        """
+        result = await db.execute(
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id
+            )
+        )
         conv = result.scalars().first()
+
         if not conv:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Conversation not found with id: {str(conversation_id)}"
+                detail="Conversation not found"
             )
 
-        # Get messages in ascending order
-        msg_stmt = select(Message).filter(Message.conversation_id == conversation_id).order_by(Message.created_at.asc())
-        msg_result = await db.execute(msg_stmt)
-        messages = msg_result.scalars().all()
+        # Load messages
+        msgs_result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at)
+        )
+        messages = list(msgs_result.scalars().all())
 
-        message_responses = []
-        for m in messages:
-            # Parse sources from JSON array/field
-            sources_data = m.sources if m.sources is not None else []
-            message_responses.append(MessageResponse(
+        msg_responses = [
+            MessageResponse(
                 id=m.id,
-                role=m.role,
+                role=m.role if isinstance(m.role, str) else m.role.value,
                 content=m.content,
-                sources=sources_data,
+                sources=m.sources,
                 createdAt=m.created_at
-            ))
+            )
+            for m in messages
+        ]
 
         return ConversationResponse(
             id=conv.id,
             title=conv.title,
-            messages=message_responses,
+            messages=msg_responses,
             createdAt=conv.created_at,
             updatedAt=conv.updated_at
         )
 
-    async def delete_conversation(self, conversation_id: UUID, user_id: UUID, db: AsyncSession) -> None:
-        # Verify ownership
-        stmt = select(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id)
-        result = await db.execute(stmt)
+    async def delete_conversation(
+        self,
+        conversation_id: UUID,
+        user_id: UUID,
+        db: AsyncSession
+    ) -> None:
+        """
+        Delete a conversation (and its messages via CASCADE) after
+        verifying the requesting user owns it.
+        """
+        result = await db.execute(
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id
+            )
+        )
         conv = result.scalars().first()
+
         if not conv:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Conversation not found with id: {str(conversation_id)}"
+                detail="Conversation not found"
             )
 
-        # Cascade deletes messages automatically due to ForeignKey cascade delete
         await db.delete(conv)
         await db.commit()
 
-# Instantiate service singleton
+
 chat_service = ChatService()
+

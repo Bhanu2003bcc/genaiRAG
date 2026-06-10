@@ -1,23 +1,30 @@
 import logging
 import math
+import asyncio
 from uuid import UUID
 from typing import List, Tuple
 from fastapi import HTTPException, status, UploadFile
 from sqlalchemy import select, func, desc, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Document, DocumentChunk, User
-from app.schemas import DocumentResponse, PageResponse
+from app.models import Document, DocumentChunk
+from app.schemas import DocumentResponse, PageResponse, CurrentUser
 from app.database import AsyncSessionLocal
-from app.utils.chunker import TextChunker
+from app.utils.chunker import TextChunker, SemanticChunker
 from app.utils.parser import parse_document
 from app.services.gemini_service import gemini_service
+from app.config import settings
 
 logger = logging.getLogger("com.rag.service.impl.DocumentServiceImpl")
 
+# Global semaphore to limit concurrent background document embedding jobs (preventing rate limit bursts)
+doc_processing_semaphore = asyncio.Semaphore(settings.doc_processing_max_concurrent)
+
+
 class DocumentService:
     def __init__(self):
-        self.text_chunker = TextChunker()
+        self.text_chunker = TextChunker()                    # recursive splitter (sync fallback)
+        self.semantic_chunker = None                         # initialised lazily after gemini_service is ready
         self.supported_types = {
             "application/pdf",
             "text/plain",
@@ -49,14 +56,20 @@ class DocumentService:
             updatedAt=doc.updated_at
         )
 
-    async def upload(self, file: UploadFile, user: User, db: AsyncSession) -> Tuple[DocumentResponse, bytes]:
-        # Validate file
-        # Reading size directly
+    async def upload(self, file: UploadFile, user: CurrentUser, db: AsyncSession) -> Tuple[DocumentResponse, bytes]:
+        # Validate file size
         file_bytes = await file.read()
         if len(file_bytes) == 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="File is empty"
+            )
+
+        max_bytes = settings.max_upload_size_mb * 1024 * 1024
+        if len(file_bytes) > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"File size exceeds the limit of {settings.max_upload_size_mb} MB"
             )
 
         file_type = file.content_type
@@ -100,58 +113,84 @@ class DocumentService:
         Background task to process the document text, chunk it, 
         generate embeddings, and save document chunks.
         """
-        # Create a dedicated db session for background execution
-        async with AsyncSessionLocal() as db:
-            # Fetch document
-            stmt = select(Document).filter(Document.id == document_id)
-            result = await db.execute(stmt)
-            document = result.scalars().first()
-            if not document:
-                logger.error(f"Async document processing failed: Document not found: {document_id}")
-                return
+        async with doc_processing_semaphore:
+            # Create a dedicated db session for background execution
+            async with AsyncSessionLocal() as db:
+                # Fetch document
+                stmt = select(Document).filter(Document.id == document_id)
+                result = await db.execute(stmt)
+                document = result.scalars().first()
+                if not document:
+                    logger.error(f"Async document processing failed: Document not found: {document_id}")
+                    return
 
-            try:
-                document.status = "PROCESSING"
-                await db.commit()
-                await db.refresh(document)
+                try:
+                    document.status = "PROCESSING"
+                    await db.commit()
+                    await db.refresh(document)
 
-                # Parse document text
-                raw_text = parse_document(document.file_type, file_bytes)
-                if not raw_text or not raw_text.strip():
-                    raise ValueError("Could not extract text from document")
+                    # Parse document text
+                    raw_text = parse_document(document.file_type, file_bytes)
+                    if not raw_text or not raw_text.strip():
+                        raise ValueError("Could not extract text from document")
 
-                # Chunk document content
-                chunks = self.text_chunker.chunk(raw_text)
-                if not chunks:
-                    raise ValueError("No text chunks generated")
+                    # Chunk document content.
+                    # Prefer SemanticChunker (if enabled) with TextChunker as default/fallback.
+                    chunks = None
+                    if settings.semantic_chunking_enabled:
+                        if self.semantic_chunker is None:
+                            self.semantic_chunker = SemanticChunker(
+                                embed_fn=gemini_service.generate_embedding,
+                                similarity_threshold=0.75,
+                                max_tokens=400,
+                                chunk_overlap=80,
+                            )
+                        try:
+                            chunks = await self.semantic_chunker.chunk(raw_text)
+                            if not chunks:
+                                raise ValueError("SemanticChunker returned no chunks")
+                            logger.info(
+                                f"SemanticChunker produced {len(chunks)} chunks for document {document_id}"
+                            )
+                        except Exception as chunk_err:
+                            logger.warning(
+                                f"SemanticChunker failed ({chunk_err}); falling back to TextChunker"
+                            )
 
-                # Generate embeddings and save chunks
-                chunk_entities = []
-                for i, chunk_text in enumerate(chunks):
-                    # Call Gemini embedding API
-                    embedding = await gemini_service.generate_embedding(chunk_text)
-                    token_count = len(chunk_text.split())
-                    
-                    chunk = DocumentChunk(
-                        document_id=document.id,
-                        chunk_index=i,
-                        content=chunk_text,
-                        embedding=embedding,
-                        token_count=token_count
-                    )
-                    chunk_entities.append(chunk)
+                    if not chunks:
+                        logger.info(f"Using TextChunker for document {document_id}")
+                        chunks = self.text_chunker.chunk(raw_text)
 
-                db.add_all(chunk_entities)
-                document.chunk_count = len(chunks)
-                document.status = "COMPLETED"
-                await db.commit()
-                logger.info(f"Document processed successfully: {document_id} with {len(chunks)} chunks")
+                    if not chunks:
+                        raise ValueError("No text chunks generated")
 
-            except Exception as e:
-                logger.error(f"Document processing failed for id: {document_id}. Error: {str(e)}", exc_info=True)
-                document.status = "FAILED"
-                document.error_message = str(e)
-                await db.commit()
+                    # Generate embeddings and save chunks
+                    chunk_entities = []
+                    for i, chunk_text in enumerate(chunks):
+                        # Call Gemini embedding API
+                        embedding = await gemini_service.generate_embedding(chunk_text)
+                        token_count = len(chunk_text.split())
+                        
+                        chunk = DocumentChunk(
+                            document_id=document.id,
+                            chunk_index=i,
+                            content=chunk_text,
+                            embedding=embedding,
+                            token_count=token_count
+                        )
+                        chunk_entities.append(chunk)
+
+                    db.add_all(chunk_entities)
+                    document.chunk_count = len(chunks)
+                    document.status = "COMPLETED"
+                    await db.commit()
+                    logger.info(f"Document processed successfully: {document_id} with {len(chunks)} chunks")
+
+                except Exception as e:
+                    logger.error(f"Document processing failed for id: {document_id}. Error: {str(e)}", exc_info=True)
+                    document.status = "FAILED"
+                    document.error_message = str(e)
+                    await db.commit()
 
     async def get_documents(self, user_id: UUID, page: int, size: int, db: AsyncSession) -> PageResponse[DocumentResponse]:
         # Count total elements

@@ -8,11 +8,18 @@ T = TypeVar('T')
 class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
-    password: str = Field(..., min_length=6, max_length=100)
+    password: str = Field(..., min_length=6, max_length=128)
 
 class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=50)
+    password: str = Field(..., min_length=1, max_length=128)
+
+# Lightweight identity extracted from a verified JWT — no database lookup required.
+# Use this as the return type of get_current_user for all protected endpoints.
+class CurrentUser(BaseModel):
+    id: UUID
     username: str
-    password: str
+    role: str
 
 class ChatRequest(BaseModel):
     message: str
