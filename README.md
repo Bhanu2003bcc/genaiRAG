@@ -11,6 +11,8 @@ A high-performance Python/FastAPI rewrite of the Java pgvector RAG (Retrieval-Au
 - **Unified Schema & Error Handling**: Pydantic models structure all payloads and response validation errors return clean Spring-compatible global error bodies.
 
 ---
+<img width="1891" height="1011" alt="image" src="https://github.com/user-attachments/assets/c7563d72-4236-4847-bf50-18eeb5d0a0a4" />
+
 
 ## Tech Stack
 
